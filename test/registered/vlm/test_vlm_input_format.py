@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.hf_transformers_utils import _fix_added_tokens_encoding
+from sglang.test.test_utils import is_in_ci
 
 register_cuda_ci(est_time=747, suite="stage-b-test-1-gpu-large")
 
@@ -703,6 +704,64 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             )
             vision_embedding = vision_output.last_hidden_state
             return cls.resampler_model(vision_embedding, tgt_sizes_tensor)
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
+@unittest.skipIf(is_in_ci(), "Model is too large")
+class TestPixtralUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "mistral-community/pixtral-12b"
+    chat_template = "mistral"
+
+    @classmethod
+    def _init_visual(cls):
+        from transformers import LlavaForConditionalGeneration
+
+        model = LlavaForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        )
+
+        base_model = model.model
+
+        cls.vision_tower = base_model.vision_tower.eval().to(cls.device)
+
+        cls.multi_modal_projector = base_model.multi_modal_projector.eval().to(
+            cls.device
+        )
+        cls.vision_feature_layer = model.config.vision_feature_layer
+        cls.vision_feature_select_strategy = model.config.vision_feature_select_strategy
+
+        def visual_func(processor_output):
+            # Adapted from https://github.com/huggingface/transformers/blob/756dffe0d664419d2f620e131ed426373cfd6f12/src/transformers/models/llava/modeling_llava.py#L150
+            image_outputs = cls.vision_tower(
+                processor_output["pixel_values"],
+                output_hidden_states=True,  # Ignore arg on purpose
+                return_dict=True,
+            )
+
+            # If we have one vision feature layer, return the corresponding hidden states,
+            # otherwise, select the hidden states of each feature layer and concatenate them
+            if isinstance(cls.vision_feature_layer, int):
+                selected_image_feature = image_outputs.hidden_states[
+                    cls.vision_feature_layer
+                ]
+                if cls.vision_feature_select_strategy == "default":
+                    selected_image_feature = selected_image_feature[:, 1:]
+            else:
+                hs_pool = [
+                    image_outputs.hidden_states[layer_idx]
+                    for layer_idx in cls.vision_feature_layer
+                ]
+                # For default; crop CLS from each hidden state in the hidden state pool
+                if cls.vision_feature_select_strategy == "default":
+                    hs_pool = [hs[:, 1:] for hs in hs_pool]
+                selected_image_feature = torch.cat(hs_pool, dim=-1)
+
+            image_features = cls.multi_modal_projector(selected_image_feature)
+            return image_features
 
         cls.visual = visual_func
 
