@@ -116,7 +116,8 @@ def _getattr_first(obj, names, default=None):
 
 
 def _resolve_attention_backend_model_cls(config: PretrainedConfig):
-    model_cls = getattr(transformers, getattr(config, "architectures", [""])[0], None)
+    architecture = config.architectures[0] if config.architectures else ""
+    model_cls = getattr(transformers, architecture, None)
     if model_cls is not None:
         return model_cls
 
