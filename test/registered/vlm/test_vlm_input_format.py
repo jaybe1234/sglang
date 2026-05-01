@@ -10,6 +10,7 @@ import torch
 # be missing in transformers==4.57.1. Inject a lightweight implementation so
 # the model can import successfully without downgrading transformers.
 import transformers.activations as _hf_activations
+from einops import rearrange
 from PIL import Image
 from transformers import (
     AutoModel,
@@ -703,6 +704,47 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             )
             vision_embedding = vision_output.last_hidden_state
             return cls.resampler_model(vision_embedding, tgt_sizes_tensor)
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
+class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "deepseek-ai/Janus-Pro-7B"
+    chat_template = "janus-pro"
+
+    @classmethod
+    def _init_visual(cls):
+        from transformers import AutoConfig
+
+        from sglang.srt.models.deepseek_janus_pro import CLIPVisionTower, MlpProjector
+
+        config = AutoConfig.from_pretrained(cls.model_path)
+        vision_config = config.vision_config
+        cls.vision_model = CLIPVisionTower(**vision_config.params)
+
+        aligner_config = config.aligner_config
+        cls.aligner = MlpProjector(aligner_config.params)
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"]
+            bs, n = pixel_values.shape[0:2]
+            pixel_values = pixel_values.to(
+                device=cls.vision_model.device, dtype=cls.vision_model.dtype
+            )
+            images = rearrange(pixel_values, "b n c h w -> (b n) c h w")
+
+            # [b x n, T2, D]
+            images_embeds = cls.aligner(cls.vision_model(images))
+
+            # [b x n, T2, D] -> [b, n x T2, D]
+            images_embeds = rearrange(
+                images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n
+            )
+
+            return images_embeds
 
         cls.visual = visual_func
 
