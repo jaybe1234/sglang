@@ -6,7 +6,11 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalInputFormat,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
     PixtralVisionModel,
@@ -63,6 +67,21 @@ class PixtralProcessor(BaseMultimodalProcessor):
             }
         )
 
+    @staticmethod
+    def _has_special_format(image_data):
+        """Check if any input items use processor_output or precomputed_embedding format."""
+        for data in list(image_data or []):
+            data_format = data.get("format")
+            if data_format in (
+                MultimodalInputFormat.PROCESSOR_OUTPUT.name,
+                MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
+                "processor_output",
+                "precomputed_embedding",
+            ):
+                return True
+
+        return False
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
@@ -77,7 +96,8 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_data=image_data,
             return_text=True,
         )
-        if mm_data.images:
+
+        if mm_data.images and not self._has_special_format(mm_data.images):
             effective_patch = self.patch_size * self._spatial_merge_size
             image_nrows = []
             for img in mm_data.images:
