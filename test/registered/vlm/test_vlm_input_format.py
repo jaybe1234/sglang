@@ -1,7 +1,7 @@
 import json
 import unittest
 from io import BytesIO
-from typing import Optional
+from typing import List, Optional, Tuple, Union
 
 import requests
 import torch
@@ -717,16 +717,217 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
     @classmethod
     def _init_visual(cls):
+        import torch.nn as nn
+        import torch.nn.functional as F
         from transformers import AutoConfig
 
-        from sglang.srt.models.deepseek_janus_pro import CLIPVisionTower, MlpProjector
+        from sglang.srt.models.deepseek_janus_pro import (
+            CLIPVisionTower,
+            DropPath,
+            LayerScale,
+            Mlp,
+            MlpProjector,
+            SigLIP_MODEL_CONFIG,
+            SigLIPVisionCfg,
+            VisionTransformer,
+        )
+
+        class Attention(nn.Module):
+            fused_attn: bool
+
+            def __init__(
+                self,
+                dim: int,
+                num_heads: int = 8,
+                qkv_bias: bool = False,
+                qk_norm: bool = False,
+                attn_drop: float = 0.0,
+                proj_drop: float = 0.0,
+                norm_layer: nn.Module = nn.LayerNorm,
+            ) -> None:
+                super().__init__()
+                assert dim % num_heads == 0, "dim should be divisible by num_heads"
+                self.num_heads = num_heads
+                self.head_dim = dim // num_heads
+                self.scale = self.head_dim**-0.5
+                self.fused_attn = True
+
+                self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+                self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+                self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+                self.attn_drop = nn.Dropout(attn_drop)
+                self.proj = nn.Linear(dim, dim)
+                self.proj_drop = (
+                    nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                B, N, C = x.shape
+                qkv = (
+                    self.qkv(x)
+                    .reshape(B, N, 3, self.num_heads, self.head_dim)
+                    .permute(2, 0, 3, 1, 4)
+                )
+                q, k, v = qkv.unbind(0)
+                q, k = self.q_norm(q), self.k_norm(k)
+
+                if self.fused_attn:
+                    x = F.scaled_dot_product_attention(
+                        q,
+                        k,
+                        v,
+                        dropout_p=self.attn_drop.p if self.training else 0.0,
+                    )
+                else:
+                    q = q * self.scale
+                    attn = q @ k.transpose(-2, -1)
+                    attn = attn.softmax(dim=-1)
+                    attn = self.attn_drop(attn)
+                    x = attn @ v
+
+                x = x.transpose(1, 2).reshape(B, N, C)
+                x = self.proj(x)
+                x = self.proj_drop(x)
+                return x
+
+        class Block(nn.Module):
+            def __init__(
+                self,
+                dim: int,
+                num_heads: int,
+                mlp_ratio: float = 4.0,
+                qkv_bias: bool = False,
+                qk_norm: bool = False,
+                proj_drop: float = 0.0,
+                attn_drop: float = 0.0,
+                init_values: Optional[float] = None,
+                drop_path: float = 0.0,
+                act_layer: nn.Module = nn.GELU,
+                norm_layer: nn.Module = nn.LayerNorm,
+                mlp_layer: nn.Module = Mlp,
+            ) -> None:
+                super().__init__()
+                self.norm1 = norm_layer(dim)
+                self.attn = Attention(
+                    dim,
+                    num_heads=num_heads,
+                    qkv_bias=qkv_bias,
+                    qk_norm=qk_norm,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                    norm_layer=norm_layer,
+                )
+                self.ls1 = (
+                    LayerScale(dim, init_values=init_values)
+                    if init_values
+                    else nn.Identity()
+                )
+                self.drop_path1 = (
+                    DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+                )
+
+                self.norm2 = norm_layer(dim)
+                self.mlp = mlp_layer(
+                    in_features=dim,
+                    hidden_features=int(dim * mlp_ratio),
+                    act_layer=act_layer,
+                    drop=proj_drop,
+                )
+                self.ls2 = (
+                    LayerScale(dim, init_values=init_values)
+                    if init_values
+                    else nn.Identity()
+                )
+                self.drop_path2 = (
+                    DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+                x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+                return x
+
+        class CLIPVisionTowerWrapper(CLIPVisionTower):
+            def __init__(
+                self,
+                model_name: str = "siglip_large_patch16_384",
+                image_size: Union[Tuple[int, int], int] = 336,
+                select_feature: str = "patch",
+                select_layer: int = -2,
+                select_layers: Optional[List] = None,
+                ckpt_path: str = "",
+                pixel_mean: Optional[List[float]] = None,
+                pixel_std: Optional[List[float]] = None,
+                **kwargs,
+            ):
+                super().__init__(
+                    model_name="siglip_large_patch16_384",
+                    image_size=336,
+                    select_feature="patch",
+                    select_layer=-2,
+                    select_layers=None,
+                    ckpt_path="",
+                    pixel_mean=None,
+                    pixel_std=None,
+                    **kwargs,
+                )
+
+            def build_vision_tower(self, vision_tower_params):
+                self.select_feature = "same"
+                model_name = vision_tower_params.get(
+                    "model_name", "siglip_so400m_patch14_384"
+                )
+                vision_cfg = SigLIPVisionCfg(**SigLIP_MODEL_CONFIG[model_name])
+
+                select_layer = vision_tower_params.get("select_layer", 1)
+                if select_layer <= 0:
+                    layers = min(
+                        vision_cfg.layers, vision_cfg.layers + select_layer + 1
+                    )
+                else:
+                    layers = min(vision_cfg.layers, select_layer)
+
+                vision_tower = VisionTransformer(
+                    img_size=vision_tower_params.get("image_size", -1),
+                    patch_size=vision_cfg.patch_size,
+                    embed_dim=vision_cfg.width,
+                    depth=layers,
+                    num_heads=vision_cfg.heads,
+                    mlp_ratio=vision_cfg.mlp_ratio,
+                    class_token=vision_cfg.class_token,
+                    global_pool=vision_cfg.global_pool,
+                    ignore_head=vision_tower_params.get("ignore_head", True),
+                    weight_init=vision_tower_params.get("weight_init", "skip"),
+                    num_classes=0,
+                    block_fn=Block,
+                )
+
+                ckpt_path = vision_tower_params.get("ckpt_path")
+                if ckpt_path:
+                    state_dict = torch.load(
+                        ckpt_path, map_location="cpu", weights_only=True
+                    )
+
+                    incompatible_keys = vision_tower.load_state_dict(
+                        state_dict, strict=False
+                    )
+                    print(
+                        f"SigLIP-ViT restores from {ckpt_path},\n"
+                        f"\tincompatible_keys:', {incompatible_keys}."
+                    )
+
+                forward_kwargs = dict()
+                return vision_tower, forward_kwargs
 
         config = AutoConfig.from_pretrained(cls.model_path)
         vision_config = config.vision_config
-        cls.vision_model = CLIPVisionTower(**vision_config.params)
+
+        cls.vision_model = (
+            CLIPVisionTowerWrapper(**vision_config.params).eval().to(cls.device)
+        )
 
         aligner_config = config.aligner_config
-        cls.aligner = MlpProjector(aligner_config.params)
+        cls.aligner = MlpProjector(aligner_config.params).eval().to(cls.device)
 
         def visual_func(processor_output):
             pixel_values = processor_output["pixel_values"]
