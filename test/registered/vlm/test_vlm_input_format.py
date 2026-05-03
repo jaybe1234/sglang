@@ -963,7 +963,7 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             prompt=text,
             images=self.main_image,
             return_tensors="pt",
-        ).to(self.device)
+        )
 
         return inputs, text
 
