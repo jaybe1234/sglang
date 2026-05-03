@@ -861,14 +861,14 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                 **kwargs,
             ):
                 super().__init__(
-                    model_name="siglip_large_patch16_384",
-                    image_size=336,
-                    select_feature="patch",
-                    select_layer=-2,
-                    select_layers=None,
-                    ckpt_path="",
-                    pixel_mean=None,
-                    pixel_std=None,
+                    model_name=model_name,
+                    image_size=image_size,
+                    select_feature=select_feature,
+                    select_layer=select_layer,
+                    select_layers=select_layers,
+                    ckpt_path=ckpt_path,
+                    pixel_mean=pixel_mean,
+                    pixel_std=pixel_std,
                     **kwargs,
                 )
 
