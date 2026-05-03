@@ -952,6 +952,21 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
 
+    def get_processor_output(self, req: Optional[ChatCompletionRequest] = None):
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        # Process inputs using processor
+        inputs = self.processor(
+            prompt=text,
+            images=self.main_image,
+            return_tensors="pt",
+        ).to(self.device)
+
+        return inputs, text
+
 
 if __name__ == "__main__":
     unittest.main()
