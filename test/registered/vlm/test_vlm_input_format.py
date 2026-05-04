@@ -929,6 +929,48 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         aligner_config = config.aligner_config
         cls.aligner = MlpProjector(aligner_config.params).eval().to(cls.device)
 
+        # Reuse SGLang's loader helpers so the test mirrors the engine's
+        # download path: HfFileSystem listing + pattern auto-selection +
+        # cache reuse. Janus-Pro ships only pytorch_model-*.bin on the Hub,
+        # so download_weights_from_hf will narrow allow_patterns to "*.bin".
+        # MultiModalityCausalLM stores vision_model.* and aligner.* at the
+        # top level (see deepseek_janus_pro.py:1933, 1937); strip the prefix
+        # and discard gen_*/language_model.*.
+        import glob
+        import os
+
+        from sglang.srt.model_loader.weight_utils import (
+            download_weights_from_hf,
+            pt_weights_iterator,
+            safetensors_weights_iterator,
+        )
+
+        hf_folder = download_weights_from_hf(
+            cls.model_path,
+            cache_dir=None,
+            allow_patterns=["*.safetensors", "*.bin"],
+        )
+
+        shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.safetensors")))
+        if shard_files:
+            iterator = safetensors_weights_iterator(shard_files)
+        else:
+            shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.bin")))
+            assert shard_files, f"No weight shards in {hf_folder}"
+            iterator = pt_weights_iterator(shard_files)
+
+        vision_state, aligner_state = {}, {}
+        for name, tensor in iterator:
+            if name.startswith("vision_model."):
+                vision_state[name[len("vision_model.") :]] = tensor
+            elif name.startswith("aligner."):
+                aligner_state[name[len("aligner.") :]] = tensor
+
+        miss_v, _ = cls.vision_model.load_state_dict(vision_state, strict=False)
+        miss_a, _ = cls.aligner.load_state_dict(aligner_state, strict=False)
+        assert not miss_v, f"vision_model missing weights: {miss_v[:5]}"
+        assert not miss_a, f"aligner missing weights: {miss_a[:5]}"
+
         def visual_func(processor_output):
             pixel_values = processor_output["pixel_values"]
             bs, n = pixel_values.shape[0:2]
